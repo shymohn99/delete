@@ -1,4 +1,3 @@
-# trigger-2
 name: scrape-battlecode-replays
 
 on:
@@ -17,12 +16,11 @@ jobs:
       - name: Inspect Battlecode site
         shell: python
         run: |
-          import os, re, json, urllib.parse, pathlib
+          import re, json, urllib.parse, pathlib
           import requests
-          from bs4 import BeautifulSoup
 
           out = pathlib.Path("out")
-          out.mkdir()
+          out.mkdir(exist_ok=True)
           s = requests.Session()
           s.headers["User-Agent"] = "Mozilla/5.0 replay-collector/1.0"
 
@@ -42,10 +40,9 @@ jobs:
                   name = re.sub(r"[^A-Za-z0-9._-]+", "_", urllib.parse.urlparse(url).path.strip("/") or "root") + ".html"
                   (out / name).write_bytes(r.content)
                   if "text/html" in (r.headers.get("content-type") or ""):
-                      soup = BeautifulSoup(r.text, "html.parser")
-                      for tag in soup.find_all("script", src=True):
-                          script_urls.add(urllib.parse.urljoin(r.url, tag["src"]))
-                      links = [urllib.parse.urljoin(r.url, a.get("href")) for a in soup.find_all("a", href=True)]
+                      for src in re.findall(r'<script[^>]+src=["\\\']([^"\\\']+)["\\\']', r.text, re.I):
+                          script_urls.add(urllib.parse.urljoin(r.url, src))
+                      links = [urllib.parse.urljoin(r.url, h) for h in re.findall(r'<a[^>]+href=["\\\']([^"\\\']+)["\\\']', r.text, re.I)]
                       (out / (name + ".links.txt")).write_text("\n".join(links))
               except Exception as e:
                   report.append({"url": url, "error": repr(e)})
@@ -59,16 +56,15 @@ jobs:
                   r = s.get(u, timeout=30)
                   txt = r.text
                   (out / f"script_{i:03d}.js").write_text(txt)
-                  for pat in [r"[^\"']*replay[^\"']*", r"[^\"']*battle[^\"']*", r"/api/[^\"']+", r"\.replay"]:
+                  for pat in [r'[^"\\\']*replay[^"\\\']*', r'[^"\\\']*battle[^"\\\']*', r'/api/[^"\\\']+', r'\\.replay']:
                       for m in re.finditer(pat, txt, re.I):
                           frag = m.group(0)
-                          if len(frag) < 500:
+                          if len(frag) < 800:
                               hits.append({"script": u, "match": frag})
               except Exception as e:
                   hits.append({"script": u, "error": repr(e)})
           (out / "js_hits.json").write_text(json.dumps(hits, indent=2))
 
-          # Probe common public replay endpoints without assuming auth.
           probes = []
           for mid in [766, 767, 722, 485]:
               for tmpl in [
@@ -79,17 +75,20 @@ jobs:
                   "https://game.battlecode.au/replays/{}",
                   "https://game.battlecode.au/battles/{}/replay",
                   "https://game.battlecode.au/replay/{}.replay",
+                  "https://game.battlecode.au/api/battle/{}/replay",
+                  "https://game.battlecode.au/api/replay/{}",
               ]:
                   u = tmpl.format(mid)
                   try:
                       r = s.get(u, timeout=20, allow_redirects=True)
                       probes.append({"url": u, "status": r.status_code, "final_url": r.url, "type": r.headers.get("content-type"), "len": len(r.content), "disp": r.headers.get("content-disposition")})
-                      if r.status_code == 200 and len(r.content) > 0:
-                          safe = re.sub(r"[^A-Za-z0-9._-]+", "_", u)
-                          (out / ("probe_" + safe[-120:])).write_bytes(r.content)
                   except Exception as e:
                       probes.append({"url": u, "error": repr(e)})
           (out / "probes.json").write_text(json.dumps(probes, indent=2))
+          print(json.dumps(report, indent=2))
+          print("SCRIPTS", len(script_urls))
+          print("HITS", json.dumps(hits[:100], indent=2))
+          print("PROBES", json.dumps(probes, indent=2))
 
       - uses: actions/upload-artifact@v4
         with:
