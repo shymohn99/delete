@@ -1,0 +1,96 @@
+name: scrape-battlecode-replays
+
+on:
+  push:
+    paths:
+      - ".github/workflows/scrape-battlecode-replays.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect Battlecode site
+        shell: python
+        run: |
+          import os, re, json, urllib.parse, pathlib
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = pathlib.Path("out")
+          out.mkdir()
+          s = requests.Session()
+          s.headers["User-Agent"] = "Mozilla/5.0 replay-collector/1.0"
+
+          urls = [
+              "https://game.battlecode.au/leaderboard",
+              "https://game.battlecode.au/teams/119",
+              "https://game.battlecode.au/teams/419",
+              "https://game.battlecode.au/visualiser?match=766",
+          ]
+
+          script_urls = set()
+          report = []
+          for url in urls:
+              try:
+                  r = s.get(url, timeout=30)
+                  report.append({"url": url, "status": r.status_code, "final_url": r.url, "content_type": r.headers.get("content-type"), "len": len(r.content)})
+                  name = re.sub(r"[^A-Za-z0-9._-]+", "_", urllib.parse.urlparse(url).path.strip("/") or "root") + ".html"
+                  (out / name).write_bytes(r.content)
+                  if "text/html" in (r.headers.get("content-type") or ""):
+                      soup = BeautifulSoup(r.text, "html.parser")
+                      for tag in soup.find_all("script", src=True):
+                          script_urls.add(urllib.parse.urljoin(r.url, tag["src"]))
+                      links = [urllib.parse.urljoin(r.url, a.get("href")) for a in soup.find_all("a", href=True)]
+                      (out / (name + ".links.txt")).write_text("\n".join(links))
+              except Exception as e:
+                  report.append({"url": url, "error": repr(e)})
+
+          (out / "report.json").write_text(json.dumps(report, indent=2))
+          (out / "scripts.txt").write_text("\n".join(sorted(script_urls)))
+
+          hits = []
+          for i, u in enumerate(sorted(script_urls)):
+              try:
+                  r = s.get(u, timeout=30)
+                  txt = r.text
+                  (out / f"script_{i:03d}.js").write_text(txt)
+                  for pat in [r"[^\"']*replay[^\"']*", r"[^\"']*battle[^\"']*", r"/api/[^\"']+", r"\.replay"]:
+                      for m in re.finditer(pat, txt, re.I):
+                          frag = m.group(0)
+                          if len(frag) < 500:
+                              hits.append({"script": u, "match": frag})
+              except Exception as e:
+                  hits.append({"script": u, "error": repr(e)})
+          (out / "js_hits.json").write_text(json.dumps(hits, indent=2))
+
+          # Probe common public replay endpoints without assuming auth.
+          probes = []
+          for mid in [766, 767, 722, 485]:
+              for tmpl in [
+                  "https://game.battlecode.au/api/battles/{}/replay",
+                  "https://game.battlecode.au/api/battles/{}",
+                  "https://game.battlecode.au/api/replays/{}",
+                  "https://game.battlecode.au/replays/{}.replay",
+                  "https://game.battlecode.au/replays/{}",
+                  "https://game.battlecode.au/battles/{}/replay",
+                  "https://game.battlecode.au/replay/{}.replay",
+              ]:
+                  u = tmpl.format(mid)
+                  try:
+                      r = s.get(u, timeout=20, allow_redirects=True)
+                      probes.append({"url": u, "status": r.status_code, "final_url": r.url, "type": r.headers.get("content-type"), "len": len(r.content), "disp": r.headers.get("content-disposition")})
+                      if r.status_code == 200 and len(r.content) > 0:
+                          safe = re.sub(r"[^A-Za-z0-9._-]+", "_", u)
+                          (out / ("probe_" + safe[-120:])).write_bytes(r.content)
+                  except Exception as e:
+                      probes.append({"url": u, "error": repr(e)})
+          (out / "probes.json").write_text(json.dumps(probes, indent=2))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: battlecode-inspection
+          path: out/
